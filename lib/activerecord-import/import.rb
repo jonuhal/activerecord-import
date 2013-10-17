@@ -3,7 +3,7 @@ require "ostruct"
 module ActiveRecord::Import::ConnectionAdapters ; end
 
 module ActiveRecord::Import #:nodoc:
-  class Result < Struct.new(:failed_instances, :num_inserts)
+  class Result < Struct.new(:failed_instances, :num_inserts, :ids)
   end
 
   module ImportSupport #:nodoc:
@@ -162,9 +162,10 @@ class ActiveRecord::Base
     #   BlogPost.import columns, attributes, :on_duplicate_key_update=>{ :title => :title }
     #
     # = Returns
-    # This returns an object which responds to +failed_instances+ and +num_inserts+.
+    # This returns an object which responds to +failed_instances+, +num_inserts+ and +ids+.
     # * failed_instances - an array of objects that fails validation and were not committed to the database. An empty array if no validation is performed.
-    # * num_inserts - the number of insert statements it took to import the data
+    # * num_inserts - the number of insert statements it took to import the data.
+    # * ids - the list of IDs created by the database when the data was inserted.
     def import( *args )
       options = { :validate=>true, :timestamps=>true }
       options.merge!( args.pop ) if args.last.is_a? Hash
@@ -218,13 +219,21 @@ class ActiveRecord::Base
       return_obj = if is_validating
         import_with_validations( column_names, array_of_attributes, options )
       else
-        num_inserts = import_without_validations_or_callbacks( column_names, array_of_attributes, options )
-        ActiveRecord::Import::Result.new([], num_inserts)
+        (num_inserts, ids) = import_without_validations_or_callbacks( column_names, array_of_attributes, options )
+        ActiveRecord::Import::Result.new([], num_inserts, ids)
       end
 
       if options[:synchronize]
         sync_keys = options[:synchronize_keys] || [self.primary_key]
         synchronize( options[:synchronize], sync_keys)
+      end
+
+      # if we have ids, then set the id on the models and mark the models as clean.
+      unless models.nil?
+        return_obj.ids.each_with_index do |obj, index|
+          models[index].id = obj.to_i
+          models[index].instance_variable_get(:@changed_attributes).clear # mark the model as saved
+        end
       end
 
       return_obj.num_inserts = 0 if return_obj.num_inserts.nil?
@@ -237,11 +246,12 @@ class ActiveRecord::Base
 
     # Imports the passed in +column_names+ and +array_of_attributes+
     # given the passed in +options+ Hash with validations. Returns an
-    # object with the methods +failed_instances+ and +num_inserts+.
+    # object with the methods +failed_instances+, +num_inserts+ and +ids+.
     # +failed_instances+ is an array of instances that failed validations.
     # +num_inserts+ is the number of inserts it took to import the data. See
     # ActiveRecord::Base.import for more information on
     # +column_names+, +array_of_attributes+ and +options+.
+    # +ids+ is an array of IDs created by the database when the rows were created.
     def import_with_validations( column_names, array_of_attributes, options={} )
       failed_instances = []
 
@@ -261,12 +271,12 @@ class ActiveRecord::Base
       end
       array_of_attributes.compact!
 
-      num_inserts = if array_of_attributes.empty? || options[:all_or_none] && failed_instances.any?
-                      0
-                    else
-                      import_without_validations_or_callbacks( column_names, array_of_attributes, options )
-                    end
-      ActiveRecord::Import::Result.new(failed_instances, num_inserts)
+      (num_inserts, ids) = if array_of_attributes.empty? || options[:all_or_none] && failed_instances.any?
+        [0, []]
+      else
+        import_without_validations_or_callbacks( column_names, array_of_attributes, options )
+      end
+      ActiveRecord::Import::Result.new(failed_instances, num_inserts, ids)
     end
 
     # Imports the passed in +column_names+ and +array_of_attributes+
@@ -309,11 +319,11 @@ class ActiveRecord::Base
         post_sql_statements = connection.post_sql_statements( quoted_table_name, options )
 
         # perform the inserts
-        number_inserted = connection.insert_many( [ insert_sql, post_sql_statements ].flatten,
+        (number_inserted, ids) = connection.insert_many( [ insert_sql, post_sql_statements ].flatten,
                                                   values_sql,
                                                   "#{self.class.name} Create Many Without Validations Or Callbacks" )
       end
-      number_inserted
+      [number_inserted, ids]
     end
 
     private
